@@ -2,3 +2,5 @@
 .venv/
 results/
 new_audio.wav
+*.wav
+*.zip
