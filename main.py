@@ -12,8 +12,9 @@ import tempfile
 from dotenv import load_dotenv
 import time
 import subprocess
-from codecarbon import EmissionsTracker
+# from codecarbon import EmissionsTracker
 import sounddevice as sd
+import threading
 
 # Load environment variables from .env file
 print("Loading .env variables...")
@@ -164,18 +165,21 @@ def get_gpu_power_usage():
     return power_usage_watts
 
 print("aaand I'm also starting the emissions tracker...")
-tracker = EmissionsTracker()
-tracker.start()
+# tracker = EmissionsTracker()
+# tracker.start()
 
 print("OK. Set! Training loop starts now.")
 # Training loop
-num_epochs = 25
+num_epochs = 100
+total_power_usage = 0.0
+total_training_time = 0.0
+
 for epoch in range(num_epochs):
     epoch_loss = 0
     print(f"\nStarting Epoch {epoch + 1}/{num_epochs}")
     epoch_start_time = time.time()
 
-    batch_power_usages = []
+    epoch_power_usage = 0.0
     for batch_index, data in enumerate(dataloader):
         # Measure power before starting the batch
         power_before = get_gpu_power_usage()
@@ -194,7 +198,7 @@ for epoch in range(num_epochs):
 
         # Estimate average power for this batch
         avg_power = (power_before + power_after) / 2
-        batch_power_usages.append(avg_power)
+        epoch_power_usage += avg_power
 
         batch_loss = loss.item()
         epoch_loss += batch_loss
@@ -203,12 +207,18 @@ for epoch in range(num_epochs):
 
     epoch_end_time = time.time()
     epoch_duration = epoch_end_time - epoch_start_time  # Duration in seconds
-    print(f"Epoch duration in secods: {epoch_duration}")
+
+    total_power_usage += epoch_power_usage
+    total_training_time += epoch_duration
+    print(f"Epoch duration: {epoch_duration:.2f} seconds, Total Epoch Power: {epoch_power_usage:.2f} Watts")
+
     average_loss = epoch_loss / len(dataloader)
     print(f"Epoch {epoch + 1} Complete: Average Loss = {average_loss:.6f}")
 
 print("\nTraining complete!")
-tracker.stop()
+# tracker.stop()
+
+print(f"Total Training Time: {total_training_time:.2f} seconds, Total Power Usage: {total_power_usage:.2f} Watts")
 
 # Use the encoder to get latent representations
 print("just getting the latent representation")
@@ -216,31 +226,103 @@ with torch.no_grad():
     latent_vectors = model.encoder(audio_tensor_flat)
     print("latent_vectors loaded")
 
-# Generate a new latent vector by averaging and adding noise
-print("and now generating a new (f)lat(ul)ent vector")
-new_latent = torch.mean(latent_vectors, dim=0, keepdim=True)
-print("new latent defined")
-noise = torch.randn_like(new_latent) * 0.1
-print("noise defined")
-new_latent += noise
-print(f"new_latent = {new_latent}")
+def generate_and_play_audio():
+    global playing_data
+    while not stop_flag:
+        print("Generating a new (f)lat(ul)ent vector")
 
-print("decoding it back to audiooo. Oh, how exciting")
-# Decode the new latent vector to get the new audio
-new_audio = model.decoder(new_latent)
+        # Option 1: Randomly select a latent vector instead of averaging
+        random_index = torch.randint(0, latent_vectors.size(0), (1,))
+        new_latent = latent_vectors[random_index]
+        
+        # Option 2: Alternatively, create a weighted combination of latent vectors
+        # weights = torch.rand(latent_vectors.size(0))
+        # weights /= weights.sum()  # Normalize weights to sum to 1
+        # new_latent = torch.sum(weights[:, None] * latent_vectors, dim=0, keepdim=True)
 
-print("let me rescale it to original amplitudeeee")
-# Rescale to original amplitude
-new_audio = new_audio.detach().numpy()
-new_audio = (new_audio + 1) / 2  # Scale back to [0, 1]
-new_audio = new_audio * (audio_max - audio_min + 1e-7) + audio_min
+        # Set a varying noise level
+        noise_level = random.uniform(0.1, 0.3)  # Adjust as needed for more variability
+        noise = torch.randn_like(new_latent) * noise_level
+        new_latent += noise
+        
+        # Decode the latent vector to audio
+        new_audio = model.decoder(new_latent)
 
-# Convert the numpy array to a 1D array
-new_audio = new_audio.squeeze()
+        # Rescale to original amplitude
+        new_audio = new_audio.detach().numpy()
+        new_audio = (new_audio + 1) / 2  # Scale back to [0, 1]
+        new_audio = new_audio * (audio_max - audio_min + 1e-7) + audio_min
+        new_audio = new_audio.squeeze()  # Convert to 1D array
+        
+        # Update the playing_data with the new audio
+        playing_data = new_audio
+        print("New audio generated and ready to play")
+        
+        # Wait a bit before generating the next audio
+        time.sleep(2)  # Adjust this delay as needed
 
-# Save the audio file
-print("saving it!")
-output_file = 'new_audio.wav'
-sf.write(output_file, new_audio, samplerate=sample_rate)
 
-print("Finished!")
+# Function to continuously play the current audio
+def play_audio():
+    while not stop_flag:
+        if playing_data is not None:
+            # Start playback with the latest audio, looping indefinitely
+            sd.play(playing_data, samplerate=sample_rate, loop=True)
+            sd.wait()  # Wait until playback is interrupted by new data
+
+# Initial setup
+playing_data = None  # To store the currently playing audio
+stop_flag = False  # A flag to stop the loop
+
+# Start the audio generation and playback threads
+print("Starting audio generation and playback...")
+generation_thread = threading.Thread(target=generate_and_play_audio)
+playback_thread = threading.Thread(target=play_audio)
+generation_thread.start()
+playback_thread.start()
+
+# Wait for user input to stop the loop
+input("Press Enter to stop the audio generation and playback.\n")
+stop_flag = True  # Stop the threads
+
+# Ensure playback is stopped
+sd.stop()
+
+# Wait for threads to finish
+generation_thread.join()
+playback_thread.join()
+print("Stopped.")
+
+# # Generate a new latent vector by averaging and adding noise
+# print("and now generating a new (f)lat(ul)ent vector")
+# new_latent = torch.mean(latent_vectors, dim=0, keepdim=True)
+# print("new latent defined")
+# noise = torch.randn_like(new_latent) * 0.1
+# print("noise defined")
+# new_latent += noise
+# print(f"new_latent = {new_latent}")
+
+# print("decoding it back to audiooo. Oh, how exciting")
+# # Decode the new latent vector to get the new audio
+# new_audio = model.decoder(new_latent)
+
+# print("let me rescale it to original amplitudeeee")
+# # Rescale to original amplitude
+# new_audio = new_audio.detach().numpy()
+# new_audio = (new_audio + 1) / 2  # Scale back to [0, 1]
+# new_audio = new_audio * (audio_max - audio_min + 1e-7) + audio_min
+
+# # Convert the numpy array to a 1D array
+# new_audio = new_audio.squeeze()
+
+# # Save the audio file
+# print("saving it!")
+# output_file = 'new_audio.wav'
+# sf.write(output_file, new_audio, samplerate=sample_rate)
+
+# print("Finished! Now let's hear it...")
+
+# data, fs = sf.read(output_file)
+# sd.play(data, fs, loop=True)
+# input("Press Enter to stop the fart.")
+# sd.stop()
